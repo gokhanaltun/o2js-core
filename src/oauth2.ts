@@ -192,10 +192,43 @@ export class OAuth2 {
             );
         }
 
-        return {
-            raw,
-            data: parsed as Record<string, unknown>,
-        };
+        const data = parsed as Record<string, unknown>;
+
+        if (
+            typeof data.access_token !== "string" ||
+            !data.access_token ||
+            typeof data.token_type !== "string" ||
+            !data.token_type
+        ) {
+            throw new HTTPError(
+                "Exchange: invalid token response",
+                response.status,
+                raw
+            );
+        }
+
+        if (
+            data.expires_in !== undefined &&
+            (typeof data.expires_in !== "number" || !Number.isFinite(data.expires_in))
+        ) {
+            throw new HTTPError(
+                "Exchange: invalid token expiration",
+                response.status,
+                raw
+            );
+        }
+
+        for (const key of ["refresh_token", "id_token", "scope"] as const) {
+            if (data[key] !== undefined && typeof data[key] !== "string") {
+                throw new HTTPError(
+                    `Exchange: invalid ${key} in token response`,
+                    response.status,
+                    raw
+                );
+            }
+        }
+
+        return data as unknown as ExchangeResponse;
     }
 
     async parseClaims(
@@ -322,13 +355,19 @@ export class OAuth2 {
         }
 
         // Nonce
-        if (options?.nonce !== undefined) {
+        if (payload.nonce !== undefined) {
+            if (options?.nonce === undefined) {
+                throw new Error("Expected nonce must be provided for ID Token validation");
+            }
+
             if (
                 typeof payload.nonce !== "string" ||
                 payload.nonce !== options.nonce
             ) {
                 throw new Error("Invalid ID Token: nonce mismatch");
             }
+        } else if (options?.nonce !== undefined) {
+            throw new Error("Invalid ID Token: missing nonce");
         }
 
         // Authorized party

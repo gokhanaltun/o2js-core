@@ -49,7 +49,7 @@ After the user authorizes your application, exchange the authorization code:
 ```typescript
 const response = await oauth.exchangeAuthCode(code);
 
-console.log(response.data);
+console.log(response.access_token);
 ```
 
 Refresh an access token:
@@ -238,13 +238,11 @@ After exchanging the authorization code, retrieve the ID Token from the token re
 ```typescript
 const response = await oauth.exchangeAuthCode(code);
 
-const idToken = response.data.id_token;
-
-if (typeof idToken !== "string") {
+if (typeof response.id_token !== "string") {
     throw new Error("ID Token is missing");
 }
 
-const claims = await oauth.parseClaims(idToken);
+const claims = await oauth.parseClaims(response.id_token);
 
 console.log(claims.sub);
 ```
@@ -280,7 +278,7 @@ const claims = await oauth.parseClaims(idToken, {
 });
 ```
 
-The nonce must match the value in the ID Token.
+The nonce must match the value in the ID Token. If the ID Token contains a nonce but no expected nonce is provided, validation fails. If an expected nonce is provided but the ID Token has no nonce, validation also fails.
 
 **Maximum Authentication Age**
 
@@ -352,17 +350,27 @@ Other claims provided by the identity provider are also available through the re
 
 ## Response
 
-Token exchange methods return an `ExchangeResponse`:
+Token exchange methods return an `ExchangeResponse` object directly:
 
 ```typescript
 type ExchangeResponse = {
-    raw: string;
-    data: Record<string, unknown>;
+    access_token: string;
+    token_type: string;
+    expires_in?: number;
+    refresh_token?: string;
+    id_token?: string;
+    scope?: string;
 };
 ```
 
-- `raw`: Raw response body.
-- `data`: Parsed JSON response.
+- `access_token`: The issued access token.
+- `token_type`: The type of token issued.
+- `expires_in`: Token lifetime in seconds, if provided.
+- `refresh_token`: Refresh token, if provided.
+- `id_token`: OpenID Connect ID Token, if provided.
+- `scope`: Granted scopes, if provided.
+
+`access_token` and `token_type` are required. The remaining fields are optional because their presence depends on the provider and authorization flow.
 
 ## Error Handling
 

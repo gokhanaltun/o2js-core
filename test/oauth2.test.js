@@ -78,8 +78,8 @@ test("authCodeURL omits empty state and ignores custom values for reserved param
     assert.equal(url.searchParams.has("grant_type"), false);
 });
 
-test("exchangeAuthCode sends the authorization code form request and returns raw and parsed data", async () => {
-    const raw = '{"access_token":"access-1","expires_in":3600}';
+test("exchangeAuthCode sends the authorization code form request and returns validated token fields", async () => {
+    const raw = '{"access_token":"access-1","token_type":"Bearer","expires_in":3600}';
     await withFetch(async (url, options) => {
         assert.equal(url, "https://provider.example/token");
         assert.equal(options.method, "POST");
@@ -96,7 +96,7 @@ test("exchangeAuthCode sends the authorization code form request and returns raw
         return new Response(raw, { status: 200 });
     }, async () => {
         const result = await makeOAuth2().exchangeAuthCode("auth code", { code_verifier: "verifier-value" });
-        assert.deepEqual(result, { raw, data: { access_token: "access-1", expires_in: 3600 } });
+        assert.deepEqual(result, { access_token: "access-1", token_type: "Bearer", expires_in: 3600 });
     });
 });
 
@@ -111,10 +111,10 @@ test("exchangeRefreshToken sends refresh grant parameters and accepts custom par
         assert.equal(body.get("grant_type"), "refresh_token");
         assert.equal(body.get("resource"), "https://api.example");
         assert.equal(body.has("code"), false);
-        return new Response('{"access_token":"access-2"}', { status: 200 });
+        return new Response('{"access_token":"access-2","token_type":"Bearer"}', { status: 200 });
     }, async () => {
         const result = await makeOAuth2().exchangeRefreshToken("refresh-1", { resource: "https://api.example" });
-        assert.equal(result.data.access_token, "access-2");
+        assert.equal(result.access_token, "access-2");
     });
 });
 
@@ -133,7 +133,7 @@ test("client_secret_post sends credentials in the form body", async () => {
         assert.equal(body.get("client_id"), postConfig.clientID);
         assert.equal(body.get("client_secret"), postConfig.clientSecret);
         assert.equal(body.get("code"), "post-code");
-        return new Response("{}", { status: 200 });
+        return new Response('{"access_token":"access","token_type":"Bearer"}', { status: 200 });
     }, async () => {
         await makeOAuth2({ config: { clientAuthMethod: "client_secret_post" } }).exchangeAuthCode("post-code");
     });
@@ -144,7 +144,7 @@ test("client_secret_basic form-encodes credentials before building the Basic hea
     const encoded = `${new URLSearchParams([["v", specialConfig.clientID]]).toString().slice(2)}:${new URLSearchParams([["v", specialConfig.clientSecret]]).toString().slice(2)}`;
     await withFetch(async (_url, options) => {
         assert.equal(options.headers.Authorization, `Basic ${Buffer.from(encoded).toString("base64")}`);
-        return new Response("{}", { status: 200 });
+        return new Response('{"access_token":"access","token_type":"Bearer"}', { status: 200 });
     }, async () => {
         const oauth = new OAuth2(
             makeProvider("https://provider.example/authorize", "https://provider.example/token"),
@@ -162,7 +162,7 @@ test("custom token parameters cannot replace reserved OAuth parameters", async (
         assert.equal(body.has("client_secret"), false);
         assert.equal(body.get("code"), "real-code");
         assert.equal(body.get("grant_type"), "authorization_code");
-        return new Response("{}", { status: 200 });
+        return new Response('{"access_token":"access","token_type":"Bearer"}', { status: 200 });
     }, async () => {
         await makeOAuth2().exchangeAuthCode("real-code", {
             client_id: "fake-client",
@@ -276,7 +276,103 @@ test("parseClaims validates signed ID tokens against a mocked JWKS and nonce", a
         assert.equal(claims.nonce, "expected-nonce");
         assert.equal(claims.email, "user@example.test");
         await assert.rejects(oauth.parseClaims(token, { nonce: "wrong-nonce" }), /nonce mismatch/);
+        await assert.rejects(oauth.parseClaims(token), /Expected nonce must be provided/);
     });
+});
+
+test("parseClaims requires an expected nonce when the token has none", async () => {
+    const { publicKey, privateKey } = await generateKeyPair("RS256");
+    const jwk = await exportJWK(publicKey);
+    jwk.kid = "nonce-test-key";
+    const issuerURL = "https://nonce-issuer.example";
+    const oauth = makeOAuth2({ issuerURL, jwksURL: "https://nonce-issuer.example/jwks" });
+    const now = Math.floor(Date.now() / 1000);
+    const token = await new SignJWT({})
+        .setProtectedHeader({ alg: "RS256", kid: jwk.kid })
+        .setIssuer(issuerURL)
+        .setAudience(config.clientID)
+        .setSubject("user-2")
+        .setIssuedAt(now)
+        .setExpirationTime(now + 300)
+        .sign(privateKey);
+
+    await withFetch(async () => new Response(JSON.stringify({ keys: [jwk] })), async () => {
+        await assert.rejects(oauth.parseClaims(token, { nonce: "expected" }), /missing nonce/);
+    });
+});
+
+test("parseClaims applies OIDC issuer, audience, signature, and authorized-party checks", async () => {
+    const { publicKey, privateKey } = await generateKeyPair("RS256");
+    const jwk = await exportJWK(publicKey);
+    jwk.kid = "protocol-check-key";
+    const issuerURL = "https://protocol-issuer.example";
+    const oauth = makeOAuth2({ issuerURL, jwksURL: "https://protocol-issuer.example/jwks" });
+    const now = Math.floor(Date.now() / 1000);
+
+    async function token({ issuer = issuerURL, audience = config.clientID, azp, subject = "user-3" } = {}) {
+        const jwt = new SignJWT({ ...(azp === undefined ? {} : { azp }) })
+            .setProtectedHeader({ alg: "RS256", kid: jwk.kid })
+            .setIssuer(issuer)
+            .setAudience(audience)
+            .setSubject(subject)
+            .setIssuedAt(now)
+            .setExpirationTime(now + 300);
+        return jwt.sign(privateKey);
+    }
+
+    await withFetch(async () => new Response(JSON.stringify({ keys: [jwk] })), async () => {
+        const valid = await token();
+        assert.equal((await oauth.parseClaims(valid)).sub, "user-3");
+
+        await assert.rejects(oauth.parseClaims(await token({ issuer: "https://attacker.example" })));
+        await assert.rejects(oauth.parseClaims(await token({ audience: "another-client" })));
+
+        const multiAudience = await token({ audience: [config.clientID, "api.example"], azp: config.clientID });
+        assert.equal(
+            (await oauth.parseClaims(multiAudience, { trustedAudiences: ["api.example"] })).azp,
+            config.clientID,
+        );
+        await assert.rejects(
+            oauth.parseClaims(await token({ audience: [config.clientID, "api.example"] }), { trustedAudiences: ["api.example"] }),
+            /missing authorized party/,
+        );
+        await assert.rejects(
+            oauth.parseClaims(await token({ audience: [config.clientID, "api.example"], azp: "another-client" }), { trustedAudiences: ["api.example"] }),
+            /authorized party mismatch/,
+        );
+
+        const [header, payload, signature] = valid.split(".");
+        const alteredPayload = Buffer.from(JSON.stringify({ iss: issuerURL, sub: "forged", aud: config.clientID, exp: now + 300, iat: now })).toString("base64url");
+        await assert.rejects(oauth.parseClaims(`${header}.${alteredPayload}.${signature}`));
+    });
+});
+
+test("successful token responses must contain valid required and optional fields", async (t) => {
+    const cases = [
+        ['{"token_type":"Bearer"}', "invalid token response"],
+        ['{"access_token":"access"}', "invalid token response"],
+        ['{"access_token":"","token_type":"Bearer"}', "invalid token response"],
+        ['{"access_token":"access","token_type":""}', "invalid token response"],
+        ['{"access_token":"access","token_type":"Bearer","expires_in":"3600"}', "invalid token expiration"],
+        ['{"access_token":"access","token_type":"Bearer","expires_in":null}', "invalid token expiration"],
+        ['{"access_token":"access","token_type":"Bearer","refresh_token":42}', "invalid refresh_token in token response"],
+        ['{"access_token":"access","token_type":"Bearer","id_token":false}', "invalid id_token in token response"],
+        ['{"access_token":"access","token_type":"Bearer","scope":[]}', "invalid scope in token response"],
+    ];
+
+    for (const [raw, message] of cases) {
+        await t.test(message, async () => {
+            await withFetch(async () => new Response(raw), async () => {
+                await assert.rejects(makeOAuth2().exchangeAuthCode("code"), (error) => {
+                    assert.ok(error instanceof HTTPError);
+                    assert.equal(error.message, `Exchange: ${message}`);
+                    assert.equal(error.status, 200);
+                    assert.equal(error.body, raw);
+                    return true;
+                });
+            });
+        });
+    }
 });
 
 test("parseClaims rejects invalid inputs and missing OIDC provider metadata before network access", async () => {
