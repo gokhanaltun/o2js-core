@@ -194,11 +194,27 @@ export class OAuth2 {
 
         const data = parsed as Record<string, unknown>;
 
+        // Handle OAuth and provider-specific error responses.
+        if (data.error !== undefined || data.ok === false) {
+            const errorMessage =
+                typeof data.error_description === "string"
+                    ? data.error_description
+                    : typeof data.error === "string"
+                        ? data.error
+                        : "Token request failed";
+
+            throw new HTTPError(
+                `Exchange: ${errorMessage}`,
+                response.status,
+                raw
+            );
+        }
+
         if (
             typeof data.access_token !== "string" ||
-            !data.access_token ||
+            data.access_token.length === 0 ||
             typeof data.token_type !== "string" ||
-            !data.token_type
+            data.token_type.length === 0
         ) {
             throw new HTTPError(
                 "Exchange: invalid token response",
@@ -207,32 +223,14 @@ export class OAuth2 {
             );
         }
 
-        if (
-            data.expires_in !== undefined &&
-            (typeof data.expires_in !== "number" || !Number.isFinite(data.expires_in))
-        ) {
-            throw new HTTPError(
-                "Exchange: invalid token expiration",
-                response.status,
-                raw
-            );
-        }
-
-        for (const key of ["refresh_token", "id_token", "scope"] as const) {
-            if (data[key] !== undefined && typeof data[key] !== "string") {
-                throw new HTTPError(
-                    `Exchange: invalid ${key} in token response`,
-                    response.status,
-                    raw
-                );
-            }
-        }
-
-        return data as unknown as ExchangeResponse;
+        return {
+            raw,
+            data,
+        };
     }
 
     async parseClaims(
-        idToken: string,
+        response: ExchangeResponse,
         options?: {
             nonce?: string;
             maxAge?: number;
@@ -240,8 +238,10 @@ export class OAuth2 {
             algorithms?: ("RS256" | "PS256" | "ES256" | "ES384" | "ES512")[];
         }
     ): Promise<IDTokenClaims> {
-        if (!idToken.trim()) {
-            throw new Error("ID Token cannot be empty");
+        const idToken = response.data.id_token;
+
+        if (typeof idToken !== "string" || !idToken.trim()) {
+            throw new Error("ID Token is missing or invalid");
         }
 
         const issuer = this.provider.issuerURL;
@@ -419,24 +419,59 @@ export class OAuth2 {
             throw new Error("Config cannot be null or undefined");
         }
 
-        if (!this.provider.authURL.trim()) {
-            throw new Error("Provider authorization URL cannot be empty");
+        const requireString = (value: unknown, name: string): string => {
+            if (typeof value !== "string") {
+                throw new Error(`${name} must be a string`);
+            }
+            if (!value.trim()) {
+                throw new Error(`${name} cannot be empty`);
+            }
+            return value;
+        };
+
+        const parseURI = (value: unknown, name: string): URL => {
+            const uri = requireString(value, name);
+            let parsed: URL;
+            try {
+                parsed = new URL(uri);
+            } catch {
+                throw new Error(`${name} must be an absolute URI`);
+            }
+            if (uri.includes("#")) {
+                throw new Error(`${name} cannot contain a fragment`);
+            }
+            return parsed;
+        };
+
+        const validateEndpoint = (value: unknown, name: string): void => {
+            const uri = parseURI(value, name);
+            if (uri.protocol !== "https:" && uri.protocol !== "http:") {
+                throw new Error(`${name} must use HTTPS`);
+            }
+            const isLoopback = ["localhost", "127.0.0.1", "[::1]"].includes(uri.hostname);
+            if (uri.protocol !== "https:" && !isLoopback) {
+                throw new Error(`${name} must use HTTPS`);
+            }
+            if (uri.username || uri.password) {
+                throw new Error(`${name} cannot contain credentials`);
+            }
+        };
+
+        validateEndpoint(this.provider.authURL, "Provider authorization URL");
+        validateEndpoint(this.provider.tokenURL, "Provider token URL");
+        requireString(this.config.clientID, "Client ID");
+        requireString(this.config.clientSecret, "Client secret");
+
+        const redirectURI = parseURI(this.config.redirectURL, "Redirect URL");
+        if (redirectURI.username || redirectURI.password) {
+            throw new Error("Redirect URL cannot contain credentials");
         }
 
-        if (!this.provider.tokenURL.trim()) {
-            throw new Error("Provider token URL cannot be empty");
+        if (this.provider.issuerURL !== undefined) {
+            validateEndpoint(this.provider.issuerURL, "Provider issuer URL");
         }
-
-        if (!this.config.clientID.trim()) {
-            throw new Error("Client ID cannot be empty");
-        }
-
-        if (!this.config.clientSecret.trim()) {
-            throw new Error("Client secret cannot be empty");
-        }
-
-        if (!this.config.redirectURL.trim()) {
-            throw new Error("Redirect URL cannot be empty");
+        if (this.provider.jwksURL !== undefined) {
+            validateEndpoint(this.provider.jwksURL, "Provider JWKS URL");
         }
 
         if (

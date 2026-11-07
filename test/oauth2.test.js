@@ -17,6 +17,10 @@ function makeProvider(authURL = "https://p.example/a", tokenURL = "https://p.exa
     return { authURL, tokenURL };
 }
 
+function makeExchangeResponse(data = {}) {
+    return { raw: JSON.stringify(data), data };
+}
+
 function withFetch(mock, run) {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = mock;
@@ -50,6 +54,29 @@ test("constructor rejects missing provider, config, and blank required values", 
     );
 });
 
+test("constructor validates endpoint and redirect URIs", () => {
+    for (const [options, message] of [
+        [{ authURL: "not-a-url" }, /Provider authorization URL must be an absolute URI/],
+        [{ tokenURL: "http://provider.example/token" }, /Provider token URL must use HTTPS/],
+        [{ authURL: "https://provider.example/authorize#fragment" }, /Provider authorization URL cannot contain a fragment/],
+        [{ tokenURL: "https://user:pass@provider.example/token" }, /Provider token URL cannot contain credentials/],
+        [{ config: { ...config, redirectURL: "/callback" } }, /Redirect URL must be an absolute URI/],
+        [{ config: { ...config, redirectURL: "https://app.example/callback#fragment" } }, /Redirect URL cannot contain a fragment/],
+        [{ issuerURL: "http://issuer.example" }, /Provider issuer URL must use HTTPS/],
+        [{ jwksURL: "https://issuer.example/jwks#key" }, /Provider JWKS URL cannot contain a fragment/],
+    ]) {
+        assert.throws(() => makeOAuth2(options), message);
+    }
+
+    assert.throws(() => makeOAuth2({ authURL: 42 }), /Provider authorization URL must be a string/);
+    assert.throws(() => new OAuth2(makeProvider(), { ...config, clientID: null }), /Client ID must be a string/);
+
+    assert.doesNotThrow(() => new OAuth2(
+        makeProvider("http://127.0.0.1:8080/authorize", "http://localhost:8080/token"),
+        config,
+    ));
+});
+
 test("authCodeURL sets OAuth parameters, encodes values, and retains provider query parameters", () => {
     const oauth = makeOAuth2({ authURL: "https://provider.example/authorize?tenant=acme" });
     const url = new URL(oauth.authCodeURL("state value", { scope: "profile email", prompt: "consent" }));
@@ -78,7 +105,7 @@ test("authCodeURL omits empty state and ignores custom values for reserved param
     assert.equal(url.searchParams.has("grant_type"), false);
 });
 
-test("exchangeAuthCode sends the authorization code form request and returns validated token fields", async () => {
+test("exchangeAuthCode sends the authorization code form request and returns raw and parsed data", async () => {
     const raw = '{"access_token":"access-1","token_type":"Bearer","expires_in":3600}';
     await withFetch(async (url, options) => {
         assert.equal(url, "https://provider.example/token");
@@ -96,7 +123,7 @@ test("exchangeAuthCode sends the authorization code form request and returns val
         return new Response(raw, { status: 200 });
     }, async () => {
         const result = await makeOAuth2().exchangeAuthCode("auth code", { code_verifier: "verifier-value" });
-        assert.deepEqual(result, { access_token: "access-1", token_type: "Bearer", expires_in: 3600 });
+        assert.deepEqual(result, { raw, data: { access_token: "access-1", token_type: "Bearer", expires_in: 3600 } });
     });
 });
 
@@ -114,7 +141,7 @@ test("exchangeRefreshToken sends refresh grant parameters and accepts custom par
         return new Response('{"access_token":"access-2","token_type":"Bearer"}', { status: 200 });
     }, async () => {
         const result = await makeOAuth2().exchangeRefreshToken("refresh-1", { resource: "https://api.example" });
-        assert.equal(result.access_token, "access-2");
+        assert.deepEqual(result.data, { access_token: "access-2", token_type: "Bearer" });
     });
 });
 
@@ -270,13 +297,13 @@ test("parseClaims validates signed ID tokens against a mocked JWKS and nonce", a
         assert.equal(url, "https://issuer.example/jwks");
         return new Response(JSON.stringify({ keys: [jwk] }), { headers: { "content-type": "application/json" } });
     }, async () => {
-        const claims = await oauth.parseClaims(token, { nonce: "expected-nonce", maxAge: 60 });
+        const claims = await oauth.parseClaims(makeExchangeResponse({ id_token: token }), { nonce: "expected-nonce", maxAge: 60 });
         assert.equal(claims.sub, "user-1");
         assert.equal(claims.iss, issuerURL);
         assert.equal(claims.nonce, "expected-nonce");
         assert.equal(claims.email, "user@example.test");
-        await assert.rejects(oauth.parseClaims(token, { nonce: "wrong-nonce" }), /nonce mismatch/);
-        await assert.rejects(oauth.parseClaims(token), /Expected nonce must be provided/);
+        await assert.rejects(oauth.parseClaims(makeExchangeResponse({ id_token: token }), { nonce: "wrong-nonce" }), /nonce mismatch/);
+        await assert.rejects(oauth.parseClaims(makeExchangeResponse({ id_token: token })), /Expected nonce must be provided/);
     });
 });
 
@@ -297,7 +324,7 @@ test("parseClaims requires an expected nonce when the token has none", async () 
         .sign(privateKey);
 
     await withFetch(async () => new Response(JSON.stringify({ keys: [jwk] })), async () => {
-        await assert.rejects(oauth.parseClaims(token, { nonce: "expected" }), /missing nonce/);
+        await assert.rejects(oauth.parseClaims(makeExchangeResponse({ id_token: token }), { nonce: "expected" }), /missing nonce/);
     });
 });
 
@@ -322,50 +349,76 @@ test("parseClaims applies OIDC issuer, audience, signature, and authorized-party
 
     await withFetch(async () => new Response(JSON.stringify({ keys: [jwk] })), async () => {
         const valid = await token();
-        assert.equal((await oauth.parseClaims(valid)).sub, "user-3");
+        assert.equal((await oauth.parseClaims(makeExchangeResponse({ id_token: valid }))).sub, "user-3");
 
-        await assert.rejects(oauth.parseClaims(await token({ issuer: "https://attacker.example" })));
-        await assert.rejects(oauth.parseClaims(await token({ audience: "another-client" })));
+        await assert.rejects(oauth.parseClaims(makeExchangeResponse({ id_token: await token({ issuer: "https://attacker.example" }) })));
+        await assert.rejects(oauth.parseClaims(makeExchangeResponse({ id_token: await token({ audience: "another-client" }) })));
 
         const multiAudience = await token({ audience: [config.clientID, "api.example"], azp: config.clientID });
         assert.equal(
-            (await oauth.parseClaims(multiAudience, { trustedAudiences: ["api.example"] })).azp,
+            (await oauth.parseClaims(makeExchangeResponse({ id_token: multiAudience }), { trustedAudiences: ["api.example"] })).azp,
             config.clientID,
         );
         await assert.rejects(
-            oauth.parseClaims(await token({ audience: [config.clientID, "api.example"] }), { trustedAudiences: ["api.example"] }),
+            oauth.parseClaims(makeExchangeResponse({ id_token: await token({ audience: [config.clientID, "api.example"] }) }), { trustedAudiences: ["api.example"] }),
             /missing authorized party/,
         );
         await assert.rejects(
-            oauth.parseClaims(await token({ audience: [config.clientID, "api.example"], azp: "another-client" }), { trustedAudiences: ["api.example"] }),
+            oauth.parseClaims(makeExchangeResponse({ id_token: await token({ audience: [config.clientID, "api.example"], azp: "another-client" }) }), { trustedAudiences: ["api.example"] }),
             /authorized party mismatch/,
         );
 
         const [header, payload, signature] = valid.split(".");
         const alteredPayload = Buffer.from(JSON.stringify({ iss: issuerURL, sub: "forged", aud: config.clientID, exp: now + 300, iat: now })).toString("base64url");
-        await assert.rejects(oauth.parseClaims(`${header}.${alteredPayload}.${signature}`));
+        await assert.rejects(oauth.parseClaims(makeExchangeResponse({ id_token: `${header}.${alteredPayload}.${signature}` })));
     });
 });
 
-test("successful token responses must contain valid required and optional fields", async (t) => {
-    const cases = [
-        ['{"token_type":"Bearer"}', "invalid token response"],
-        ['{"access_token":"access"}', "invalid token response"],
-        ['{"access_token":"","token_type":"Bearer"}', "invalid token response"],
-        ['{"access_token":"access","token_type":""}', "invalid token response"],
-        ['{"access_token":"access","token_type":"Bearer","expires_in":"3600"}', "invalid token expiration"],
-        ['{"access_token":"access","token_type":"Bearer","expires_in":null}', "invalid token expiration"],
-        ['{"access_token":"access","token_type":"Bearer","refresh_token":42}', "invalid refresh_token in token response"],
-        ['{"access_token":"access","token_type":"Bearer","id_token":false}', "invalid id_token in token response"],
-        ['{"access_token":"access","token_type":"Bearer","scope":[]}', "invalid scope in token response"],
-    ];
+test("token exchange preserves required OAuth response fields and provider-specific extensions", async () => {
+    const raw = '{"provider_field":true,"access_token":"access","token_type":"Bearer"}';
+    await withFetch(async () => new Response(raw), async () => {
+        assert.deepEqual(await makeOAuth2().exchangeAuthCode("code"), {
+            raw,
+            data: { provider_field: true, access_token: "access", token_type: "Bearer" },
+        });
+    });
+});
 
-    for (const [raw, message] of cases) {
-        await t.test(message, async () => {
+test("successful OAuth token responses require non-empty access_token and token_type", async (t) => {
+    for (const raw of [
+        '{"access_token":"access"}',
+        '{"token_type":"Bearer"}',
+        '{"access_token":"","token_type":"Bearer"}',
+        '{"access_token":"access","token_type":""}',
+        '{"access_token":42,"token_type":"Bearer"}',
+        '{"access_token":"access","token_type":42}',
+    ]) {
+        await t.test(raw, async () => {
             await withFetch(async () => new Response(raw), async () => {
                 await assert.rejects(makeOAuth2().exchangeAuthCode("code"), (error) => {
                     assert.ok(error instanceof HTTPError);
-                    assert.equal(error.message, `Exchange: ${message}`);
+                    assert.equal(error.message, "Exchange: invalid token response");
+                    assert.equal(error.status, 200);
+                    assert.equal(error.body, raw);
+                    return true;
+                });
+            });
+        });
+    }
+});
+
+test("OAuth and provider-specific error bodies become HTTPError even on successful HTTP status", async (t) => {
+    for (const [raw, expectedMessage] of [
+        ['{"error":"invalid_grant","error_description":"Code expired"}', "Exchange: Code expired"],
+        ['{"error":"invalid_client"}', "Exchange: invalid_client"],
+        ['{"ok":false}', "Exchange: Token request failed"],
+        ['{"error":42,"ok":false}', "Exchange: Token request failed"],
+    ]) {
+        await t.test(expectedMessage, async () => {
+            await withFetch(async () => new Response(raw, { status: 200 }), async () => {
+                await assert.rejects(makeOAuth2().exchangeAuthCode("code"), (error) => {
+                    assert.ok(error instanceof HTTPError);
+                    assert.equal(error.message, expectedMessage);
                     assert.equal(error.status, 200);
                     assert.equal(error.body, raw);
                     return true;
@@ -377,12 +430,16 @@ test("successful token responses must contain valid required and optional fields
 
 test("parseClaims rejects invalid inputs and missing OIDC provider metadata before network access", async () => {
     const oauth = makeOAuth2({ issuerURL: "https://issuer.example", jwksURL: "https://issuer.example/jwks" });
-    await assert.rejects(oauth.parseClaims("  "), /ID Token cannot be empty/);
-    await assert.rejects(oauth.parseClaims("token", { nonce: " " }), /Nonce cannot be empty/);
-    await assert.rejects(oauth.parseClaims("token", { maxAge: -1 }), /maxAge must be a non-negative number/);
-    await assert.rejects(oauth.parseClaims("token", { maxAge: Number.POSITIVE_INFINITY }), /maxAge must be a non-negative number/);
-    await assert.rejects(oauth.parseClaims("token", { trustedAudiences: [" "] }), /Trusted audiences cannot contain empty values/);
-    await assert.rejects(oauth.parseClaims("token", { algorithms: [] }), /At least one signing algorithm is required/);
-    await assert.rejects(makeOAuth2({ jwksURL: "https://issuer.example/jwks" }).parseClaims("token"), /Provider issuer URL is required/);
-    await assert.rejects(makeOAuth2({ issuerURL: "https://issuer.example" }).parseClaims("token"), /Provider JWKS URL is required/);
+    const response = makeExchangeResponse({ id_token: "token" });
+    await assert.rejects(oauth.parseClaims(makeExchangeResponse({ id_token: "  " })), /ID Token is missing or invalid/);
+    await assert.rejects(oauth.parseClaims(response, { nonce: " " }), /Nonce cannot be empty/);
+    await assert.rejects(oauth.parseClaims(response, { maxAge: -1 }), /maxAge must be a non-negative number/);
+    await assert.rejects(oauth.parseClaims(response, { maxAge: Number.POSITIVE_INFINITY }), /maxAge must be a non-negative number/);
+    await assert.rejects(oauth.parseClaims(response, { trustedAudiences: [" "] }), /Trusted audiences cannot contain empty values/);
+    await assert.rejects(oauth.parseClaims(response, { algorithms: [] }), /At least one signing algorithm is required/);
+    await assert.rejects(oauth.parseClaims(makeExchangeResponse({ id_token: 42 })), /ID Token is missing or invalid/);
+    await assert.rejects(oauth.parseClaims(makeExchangeResponse({ id_token: null })), /ID Token is missing or invalid/);
+    await assert.rejects(makeOAuth2({ jwksURL: "https://issuer.example/jwks" }).parseClaims(response), /Provider issuer URL is required/);
+    await assert.rejects(makeOAuth2({ issuerURL: "https://issuer.example" }).parseClaims(response), /Provider JWKS URL is required/);
+    await assert.rejects(oauth.parseClaims(makeExchangeResponse()), /ID Token is missing or invalid/);
 });

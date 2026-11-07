@@ -1,6 +1,6 @@
 {
   "name": "@o2js/core",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A minimal, provider-agnostic OAuth 2.0 client for Node.js.",
   "license": "MIT",
   "type": "module",

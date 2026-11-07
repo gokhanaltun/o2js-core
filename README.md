@@ -49,7 +49,7 @@ After the user authorizes your application, exchange the authorization code:
 ```typescript
 const response = await oauth.exchangeAuthCode(code);
 
-console.log(response.access_token);
+console.log(response.data);
 ```
 
 Refresh an access token:
@@ -169,15 +169,17 @@ const url = oauth.authCodeURL(state, {
 });
 ```
 
-After receiving the ID Token, pass the expected nonce to `parseClaims`:
+After exchanging the authorization code, pass the expected nonce to `parseClaims` along with the exchange response:
 
 ```typescript
-const claims = await oauth.parseClaims(idToken, {
+const response = await oauth.exchangeAuthCode(code);
+
+const claims = await oauth.parseClaims(response, {
     nonce,
 });
 ```
 
-o2js verifies that the nonce in the ID Token matches the expected value.
+o2js extracts the ID Token from the response and verifies that its nonce matches the expected value.
 
 Your application is responsible for storing and managing the nonce throughout the authorization flow.
 
@@ -233,21 +235,21 @@ The `issuerURL` and `jwksURL` properties are optional for OAuth2-only providers.
 
 ### ID Token Validation
 
-After exchanging the authorization code, retrieve the ID Token from the token response and validate it:
+After exchanging the authorization code, pass the entire exchange response to `parseClaims`:
 
 ```typescript
 const response = await oauth.exchangeAuthCode(code);
 
-if (typeof response.id_token !== "string") {
-    throw new Error("ID Token is missing");
-}
-
-const claims = await oauth.parseClaims(response.id_token);
+const claims = await oauth.parseClaims(response);
 
 console.log(claims.sub);
 ```
 
-`parseClaims` verifies the ID Token signature using the provider's JWKS and validates its issuer, audience, expiration, and required claims.
+`parseClaims` extracts the `id_token` field from `response.data`, checks that it is a non-empty string, and validates the ID Token.
+
+The method verifies the ID Token signature using the provider's JWKS and validates its issuer, audience, expiration, and required claims.
+
+An ID Token is not required in OAuth2 token responses. If the provider does not return one, `parseClaims` throws an error indicating that the ID Token is missing or invalid.
 
 ### Validation Options
 
@@ -273,7 +275,7 @@ type ParseClaimsOptions = {
 If a nonce was included in the authorization request, pass the expected value when validating the ID Token:
 
 ```typescript
-const claims = await oauth.parseClaims(idToken, {
+const claims = await oauth.parseClaims(response, {
     nonce: savedNonce,
 });
 ```
@@ -293,7 +295,7 @@ const url = oauth.authCodeURL(state, {
 Pass the same value to `parseClaims`:
 
 ```typescript
-const claims = await oauth.parseClaims(idToken, {
+const claims = await oauth.parseClaims(response, {
     maxAge: 300,
 });
 ```
@@ -307,7 +309,7 @@ By default, o2js accepts the configured client ID as a trusted audience.
 If your application expects additional audiences, specify them explicitly:
 
 ```typescript
-const claims = await oauth.parseClaims(idToken, {
+const claims = await oauth.parseClaims(response, {
     trustedAudiences: [
         "trusted-service",
     ],
@@ -323,7 +325,7 @@ The default signing algorithm is `RS256`.
 You can specify additional supported algorithms:
 
 ```typescript
-const claims = await oauth.parseClaims(idToken, {
+const claims = await oauth.parseClaims(response, {
     algorithms: ["RS256", "PS256", "ES256"],
 });
 ```
@@ -350,31 +352,37 @@ Other claims provided by the identity provider are also available through the re
 
 ## Response
 
-Token exchange methods return an `ExchangeResponse` object directly:
+Token exchange methods return an `ExchangeResponse` object:
 
 ```typescript
 type ExchangeResponse = {
-    access_token: string;
-    token_type: string;
-    expires_in?: number;
-    refresh_token?: string;
-    id_token?: string;
-    scope?: string;
+    raw: string;
+    data: Record<string, unknown>;
 };
 ```
 
-- `access_token`: The issued access token.
-- `token_type`: The type of token issued.
-- `expires_in`: Token lifetime in seconds, if provided.
-- `refresh_token`: Refresh token, if provided.
-- `id_token`: OpenID Connect ID Token, if provided.
-- `scope`: Granted scopes, if provided.
+- `raw`: The original response body as a string.
+- `data`: The parsed JSON response object.
 
-`access_token` and `token_type` are required. The remaining fields are optional because their presence depends on the provider and authorization flow.
+The response preserves provider-specific fields, allowing applications to access additional information returned by their OAuth provider.
+
+For example:
+
+```typescript
+const response = await oauth.exchangeAuthCode(code);
+
+console.log(response.data.access_token);
+console.log(response.data.team);
+console.log(response.raw);
+```
+
+Since `data` is a `Record<string, unknown>`, provider-specific fields are available as `unknown` and should be checked or narrowed before use.
+
+The `raw` property preserves the original response body for inspection and debugging.
 
 ## Error Handling
 
-HTTP and token response parsing errors are represented by `HTTPError`.
+HTTP and token response errors are represented by `HTTPError`.
 
 ```typescript
 import { HTTPError } from "@o2js/core";
@@ -391,6 +399,10 @@ try {
 ```
 
 `body` contains the raw response body when available.
+
+The exchange method checks HTTP errors and OAuth/provider-specific error responses. It does not validate individual token fields such as `access_token` or `id_token`.
+
+A successful HTTP response must contain a valid JSON object to produce an `ExchangeResponse`. If the response cannot be parsed as a JSON object, an `HTTPError` is thrown and the original response body is available through `body`.
 
 ID Token validation errors and JWT verification errors are also thrown by `parseClaims`. These may originate from the validation logic or the underlying `jose` library.
 
