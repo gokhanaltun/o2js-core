@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { generateKeyPair, exportJWK, SignJWT } from "jose";
 import { OAuth2, HTTPError } from "../dist/index.js";
 
 const config = {
@@ -8,8 +9,12 @@ const config = {
     redirectURL: "https://app.example/callback?from=test",
 };
 
-function makeOAuth2({ authURL = "https://provider.example/authorize", tokenURL = "https://provider.example/token", config: configOverrides = {} } = {}) {
-    return new OAuth2({ authURL: () => authURL, tokenURL: () => tokenURL }, { ...config, ...configOverrides });
+function makeOAuth2({ authURL = "https://provider.example/authorize", tokenURL = "https://provider.example/token", issuerURL, jwksURL, config: configOverrides = {} } = {}) {
+    return new OAuth2({ authURL, tokenURL, issuerURL, jwksURL }, { ...config, ...configOverrides });
+}
+
+function makeProvider(authURL = "https://p.example/a", tokenURL = "https://p.example/t") {
+    return { authURL, tokenURL };
 }
 
 function withFetch(mock, run) {
@@ -24,7 +29,7 @@ function withFetch(mock, run) {
 
 test("constructor rejects missing provider, config, and blank required values", () => {
     assert.throws(() => new OAuth2(null, config), /Provider cannot be null or undefined/);
-    assert.throws(() => new OAuth2({ authURL: () => "a", tokenURL: () => "b" }, null), /Config cannot be null or undefined/);
+    assert.throws(() => new OAuth2(makeProvider(), null), /Config cannot be null or undefined/);
     assert.throws(() => makeOAuth2({ authURL: "  " }), /Provider authorization URL cannot be empty/);
     assert.throws(() => makeOAuth2({ tokenURL: "  " }), /Provider token URL cannot be empty/);
 
@@ -34,7 +39,7 @@ test("constructor rejects missing provider, config, and blank required values", 
         ["redirectURL", /Redirect URL cannot be empty/],
     ]) {
         assert.throws(
-            () => new OAuth2({ authURL: () => "https://p.example/a", tokenURL: () => "https://p.example/t" }, { ...config, [field]: "  " }),
+            () => new OAuth2(makeProvider(), { ...config, [field]: "  " }),
             message,
         );
     }
@@ -102,7 +107,7 @@ test("exchangeRefreshToken sends refresh grant parameters and accepts custom par
         assert.equal(body.has("client_id"), false);
         assert.equal(body.has("client_secret"), false);
         assert.equal(body.get("refresh_token"), "refresh-1");
-        assert.equal(body.get("redirect_uri"), config.redirectURL);
+        assert.equal(body.has("redirect_uri"), false);
         assert.equal(body.get("grant_type"), "refresh_token");
         assert.equal(body.get("resource"), "https://api.example");
         assert.equal(body.has("code"), false);
@@ -142,7 +147,7 @@ test("client_secret_basic form-encodes credentials before building the Basic hea
         return new Response("{}", { status: 200 });
     }, async () => {
         const oauth = new OAuth2(
-            { authURL: () => "https://provider.example/authorize", tokenURL: () => "https://provider.example/token" },
+            makeProvider("https://provider.example/authorize", "https://provider.example/token"),
             specialConfig,
         );
         await oauth.exchangeAuthCode("code");
@@ -241,4 +246,47 @@ test("invalid JSON and non-object JSON responses become HTTPError", async (t) =>
             });
         });
     }
+});
+
+test("parseClaims validates signed ID tokens against a mocked JWKS and nonce", async () => {
+    const { publicKey, privateKey } = await generateKeyPair("RS256");
+    const jwk = await exportJWK(publicKey);
+    jwk.kid = "test-key";
+    jwk.alg = "RS256";
+    jwk.use = "sig";
+    const issuerURL = "https://issuer.example";
+    const oauth = makeOAuth2({ issuerURL, jwksURL: "https://issuer.example/jwks" });
+    const now = Math.floor(Date.now() / 1000);
+    const token = await new SignJWT({ nonce: "expected-nonce", auth_time: now, email: "user@example.test" })
+        .setProtectedHeader({ alg: "RS256", kid: "test-key" })
+        .setIssuer(issuerURL)
+        .setAudience(config.clientID)
+        .setSubject("user-1")
+        .setIssuedAt(now)
+        .setExpirationTime(now + 300)
+        .sign(privateKey);
+
+    await withFetch(async (url) => {
+        assert.equal(url, "https://issuer.example/jwks");
+        return new Response(JSON.stringify({ keys: [jwk] }), { headers: { "content-type": "application/json" } });
+    }, async () => {
+        const claims = await oauth.parseClaims(token, { nonce: "expected-nonce", maxAge: 60 });
+        assert.equal(claims.sub, "user-1");
+        assert.equal(claims.iss, issuerURL);
+        assert.equal(claims.nonce, "expected-nonce");
+        assert.equal(claims.email, "user@example.test");
+        await assert.rejects(oauth.parseClaims(token, { nonce: "wrong-nonce" }), /nonce mismatch/);
+    });
+});
+
+test("parseClaims rejects invalid inputs and missing OIDC provider metadata before network access", async () => {
+    const oauth = makeOAuth2({ issuerURL: "https://issuer.example", jwksURL: "https://issuer.example/jwks" });
+    await assert.rejects(oauth.parseClaims("  "), /ID Token cannot be empty/);
+    await assert.rejects(oauth.parseClaims("token", { nonce: " " }), /Nonce cannot be empty/);
+    await assert.rejects(oauth.parseClaims("token", { maxAge: -1 }), /maxAge must be a non-negative number/);
+    await assert.rejects(oauth.parseClaims("token", { maxAge: Number.POSITIVE_INFINITY }), /maxAge must be a non-negative number/);
+    await assert.rejects(oauth.parseClaims("token", { trustedAudiences: [" "] }), /Trusted audiences cannot contain empty values/);
+    await assert.rejects(oauth.parseClaims("token", { algorithms: [] }), /At least one signing algorithm is required/);
+    await assert.rejects(makeOAuth2({ jwksURL: "https://issuer.example/jwks" }).parseClaims("token"), /Provider issuer URL is required/);
+    await assert.rejects(makeOAuth2({ issuerURL: "https://issuer.example" }).parseClaims("token"), /Provider JWKS URL is required/);
 });

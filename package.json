@@ -1,6 +1,6 @@
 {
   "name": "@o2js/core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A minimal, provider-agnostic OAuth 2.0 client for Node.js.",
   "license": "MIT",
   "type": "module",
@@ -23,9 +23,16 @@
     "oauth",
     "oauth2",
     "oauth-2.0",
+    "openid",
+    "openid-connect",
+    "oidc",
+    "pkce",
+    "authorization-code",
+    "refresh-token",
     "authentication",
     "authorization",
     "node",
+    "nodejs",
     "typescript"
   ],
   "scripts": {
@@ -35,5 +42,8 @@
   "devDependencies": {
     "@types/node": "^26.6.6",
     "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "jose": "^6.2.15"
   }
 }

@@ -9,6 +9,10 @@ export function generateRandomState(): string {
     return randomBytes(32).toString("hex");
 }
 
+export function generateRandomNonce(): string {
+    return generateRandomState();
+}
+
 export function generateRandomPKCE(): PKCE {
     const codeVerifier = randomBytes(32).toString("base64url");
 

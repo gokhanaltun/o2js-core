@@ -8,6 +8,20 @@ import {
     baseReservedParams,
 } from "./params.js";
 
+import {
+    createRemoteJWKSet,
+    jwtVerify,
+    type JWTPayload,
+} from "jose";
+
+export type IDTokenClaims = JWTPayload & {
+    iss: string;
+    sub: string;
+    aud: string | string[];
+    exp: number;
+    iat: number;
+};
+
 function encodeFormValue(value: string): string {
     return new URLSearchParams([["value", value]])
         .toString()
@@ -15,6 +29,8 @@ function encodeFormValue(value: string): string {
 }
 
 export class OAuth2 {
+    private jwks?: ReturnType<typeof createRemoteJWKSet>;
+
     constructor(
         private provider: Provider,
         private config: Config
@@ -41,7 +57,7 @@ export class OAuth2 {
             params.set("state", state);
         }
 
-        const url = new URL(this.provider.authURL());
+        const url = new URL(this.provider.authURL);
 
         params.forEach((value, key) => {
             url.searchParams.set(key, value);
@@ -72,7 +88,6 @@ export class OAuth2 {
         const params = new URLSearchParams();
 
         params.set("refresh_token", refreshToken);
-        params.set("redirect_uri", this.config.redirectURL);
         params.set("grant_type", "refresh_token");
 
         return this.exchange(
@@ -117,7 +132,7 @@ export class OAuth2 {
         let response: Response;
 
         try {
-            response = await fetch(this.provider.tokenURL(), {
+            response = await fetch(this.provider.tokenURL, {
                 method: "POST",
                 headers,
                 body: params.toString(),
@@ -183,6 +198,179 @@ export class OAuth2 {
         };
     }
 
+    async parseClaims(
+        idToken: string,
+        options?: {
+            nonce?: string;
+            maxAge?: number;
+            trustedAudiences?: string[];
+            algorithms?: ("RS256" | "PS256" | "ES256" | "ES384" | "ES512")[];
+        }
+    ): Promise<IDTokenClaims> {
+        if (!idToken.trim()) {
+            throw new Error("ID Token cannot be empty");
+        }
+
+        const issuer = this.provider.issuerURL;
+        const jwksURL = this.provider.jwksURL;
+
+        if (!issuer?.trim()) {
+            throw new Error("Provider issuer URL is required");
+        }
+
+        if (!jwksURL?.trim()) {
+            throw new Error("Provider JWKS URL is required");
+        }
+
+        if (
+            options?.nonce !== undefined &&
+            !options.nonce.trim()
+        ) {
+            throw new Error("Nonce cannot be empty");
+        }
+
+        if (
+            options?.maxAge !== undefined &&
+            (!Number.isFinite(options.maxAge) || options.maxAge < 0)
+        ) {
+            throw new Error("maxAge must be a non-negative number");
+        }
+
+        if (
+            options?.trustedAudiences?.some(
+                (audience) => !audience.trim()
+            )
+        ) {
+            throw new Error("Trusted audiences cannot contain empty values");
+        }
+
+        const algorithms = options?.algorithms ?? ["RS256"];
+
+        if (algorithms.length === 0) {
+            throw new Error("At least one signing algorithm is required");
+        }
+
+        if (!this.jwks) {
+            this.jwks = createRemoteJWKSet(new URL(jwksURL));
+        }
+
+        const { payload } = await jwtVerify(
+            idToken,
+            this.jwks,
+            {
+                issuer,
+                audience: this.config.clientID,
+                algorithms,
+                clockTolerance: 5,
+            }
+        );
+
+        // Subject
+        if (
+            typeof payload.sub !== "string" ||
+            !payload.sub
+        ) {
+            throw new Error("Invalid ID Token: missing subject");
+        }
+
+        // Audience
+        const audiences =
+            typeof payload.aud === "string"
+                ? [payload.aud]
+                : payload.aud;
+
+        if (
+            !Array.isArray(audiences) ||
+            audiences.length === 0 ||
+            audiences.some(
+                (audience) =>
+                    typeof audience !== "string" ||
+                    !audience
+            )
+        ) {
+            throw new Error("Invalid ID Token: invalid audience");
+        }
+
+        const trustedAudiences = new Set([
+            this.config.clientID,
+            ...(options?.trustedAudiences ?? []),
+        ]);
+
+        if (
+            audiences.some(
+                (audience) => !trustedAudiences.has(audience)
+            )
+        ) {
+            throw new Error("Invalid ID Token: untrusted audience");
+        }
+
+        // Expiration
+        if (
+            typeof payload.exp !== "number" ||
+            !Number.isFinite(payload.exp)
+        ) {
+            throw new Error("Invalid ID Token: invalid expiration");
+        }
+
+        // Issued at
+        if (
+            typeof payload.iat !== "number" ||
+            !Number.isFinite(payload.iat) ||
+            payload.iat < 0
+        ) {
+            throw new Error("Invalid ID Token: invalid issued-at claim");
+        }
+
+        // Nonce
+        if (options?.nonce !== undefined) {
+            if (
+                typeof payload.nonce !== "string" ||
+                payload.nonce !== options.nonce
+            ) {
+                throw new Error("Invalid ID Token: nonce mismatch");
+            }
+        }
+
+        // Authorized party
+        if (audiences.length > 1 && typeof payload.azp !== "string") {
+            throw new Error("Invalid ID Token: missing authorized party");
+        }
+
+        if (
+            payload.azp !== undefined &&
+            (
+                typeof payload.azp !== "string" ||
+                payload.azp !== this.config.clientID
+            )
+        ) {
+            throw new Error("Invalid ID Token: authorized party mismatch");
+        }
+
+        // Authentication time
+        if (options?.maxAge !== undefined) {
+            if (typeof payload.auth_time !== "number") {
+                throw new Error("Invalid ID Token: missing authentication time");
+            }
+
+            const now = Math.floor(Date.now() / 1000);
+            const authTime = payload.auth_time;
+
+            if (!Number.isFinite(authTime) || authTime < 0) {
+                throw new Error("Invalid ID Token: invalid authentication time");
+            }
+
+            if (authTime > now + 5) {
+                throw new Error("Invalid ID Token: authentication time is in the future");
+            }
+
+            if (now - authTime > options.maxAge + 5) {
+                throw new Error("Invalid ID Token: authentication is too old");
+            }
+        }
+
+        return payload as IDTokenClaims;
+    }
+
     private validate(): void {
         if (!this.provider) {
             throw new Error("Provider cannot be null or undefined");
@@ -192,11 +380,11 @@ export class OAuth2 {
             throw new Error("Config cannot be null or undefined");
         }
 
-        if (!this.provider.authURL().trim()) {
+        if (!this.provider.authURL.trim()) {
             throw new Error("Provider authorization URL cannot be empty");
         }
 
-        if (!this.provider.tokenURL().trim()) {
+        if (!this.provider.tokenURL.trim()) {
             throw new Error("Provider token URL cannot be empty");
         }
 
